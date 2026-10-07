@@ -3,8 +3,7 @@ import { readdir, readFile, stat } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { inflateRawSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { record } from '../cache.ts';
 import { bytes, type Entry, type Kind, type Origin } from '../memory.ts';
@@ -16,7 +15,6 @@ export interface Conversation {
   exported?: Record<string, unknown>;
 }
 export interface Scan { conversations: Conversation[]; warnings: string[] }
-const exec = promisify(execFile);
 const string = (v: unknown) => typeof v === 'string' ? v : undefined;
 const codexSubagent = (metadata: Record<string, unknown>) => metadata.source === 'subagent'
   || record(metadata.source) && 'subagent' in metadata.source;
@@ -155,6 +153,78 @@ export async function scanLocal(source: 'claude' | 'codex', roots?: string[], si
   }
   return { conversations: conversations.sort((a, b) => b.date.localeCompare(a.date)), warnings };
 }
+const u16 = (b: Buffer, at: number) => b.readUInt16LE(at);
+const u32 = (b: Buffer, at: number) => b.readUInt32LE(at);
+const ZIP64 = 0xffffffff;
+interface ZipMember { name: string; method: number; size: number; offset: number; encrypted: boolean }
+/** One byte range of the archive; nothing is extracted, so members are decoded in place. */
+async function readRange(path: string, at: number, length: number, signal?: AbortSignal) {
+  if (!length) return Buffer.alloc(0);
+  const chunks: Buffer[] = [];
+  const stream = createReadStream(path, { start: at, end: at + length - 1, signal });
+  for await (const chunk of stream) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+/** ZIP64 extra field (0x0001): only the fields whose 32-bit value is the sentinel appear, in uncompressed, compressed, offset order. */
+function zip64(extra: Buffer, uncompressed: number, compressed: number, offset: number) {
+  for (let at = 0; at + 4 <= extra.length; at += 4 + u16(extra, at + 2)) {
+    if (u16(extra, at) !== 0x0001) continue;
+    const block = extra.subarray(at + 4, at + 4 + u16(extra, at + 2));
+    let p = 0, size = compressed, position = offset;
+    for (const sentinel of [uncompressed, compressed, offset]) {
+      if (sentinel !== ZIP64) continue;
+      if (p + 8 > block.length) break;
+      const value = Number(block.readBigUInt64LE(p)); p += 8;
+      if (sentinel === compressed) size = value; else if (sentinel === offset) position = value;
+    }
+    return { size, offset: position };
+  }
+  return { size: compressed, offset };
+}
+/**
+ * Members read from the archive itself; nothing is extracted. Sizes come from the central directory because a data
+ * descriptor leaves the local header blank, so the local header only says where a member's data starts.
+ */
+async function readZip(path: string, accept: (name: string) => boolean, signal?: AbortSignal) {
+  signal?.throwIfAborted();
+  // A comment can be 64 KiB and repeat the signature, so the tail window covers comment + EOCD + ZIP64 EOCD + locator.
+  const size = (await stat(path)).size, tail = await readRange(path, Math.max(0, size - 65_633), Math.min(size, 65_633), signal);
+  let end = -1;
+  for (let at = tail.length - 22; at >= 0; at--) if (u32(tail, at) === 0x06054b50 && at + 22 + u16(tail, at + 20) === tail.length) { end = at; break; }
+  if (end < 0) throw new Error(`${path}: not a readable ZIP archive (no end-of-central-directory record).`);
+  const count = u16(tail, end + 10); let cdSize = u32(tail, end + 12), cdOffset = u32(tail, end + 16);
+  if (count === 0xffff || cdSize === ZIP64 || cdOffset === ZIP64) {
+    const locator = end - 20;
+    if (locator >= 0 && u32(tail, locator) === 0x07064b50) {
+      const wide = await readRange(path, u32(tail, locator + 12), 56, signal);
+      if (u32(wide, 0) === 0x06064b50) { cdSize = Number(wide.readBigUInt64LE(40)); cdOffset = Number(wide.readBigUInt64LE(48)); }
+    }
+  }
+  const cd = await readRange(path, cdOffset, cdSize, signal), members: ZipMember[] = [];
+  for (let at = 0; at + 46 <= cd.length;) {
+    if (u32(cd, at) !== 0x02014b50) break;
+    const nameLength = u16(cd, at + 28), extraLength = u16(cd, at + 30), commentLength = u16(cd, at + 32);
+    const member: ZipMember = { name: cd.toString('utf8', at + 46, at + 46 + nameLength), method: u16(cd, at + 10),
+      size: u32(cd, at + 20), offset: u32(cd, at + 42), encrypted: (u16(cd, at + 8) & 1) === 1 };
+    const wide = zip64(cd.subarray(at + 46 + nameLength, at + 46 + nameLength + extraLength), u32(cd, at + 24), member.size, member.offset);
+    member.size = wide.size; member.offset = wide.offset;
+    if (accept(member.name)) members.push(member);
+    at += 46 + nameLength + extraLength + commentLength;
+  }
+  const documents: { file: string; content: string }[] = [];
+  for (const member of members) {
+    signal?.throwIfAborted();
+    const label = `${path}:${member.name}`;
+    if (member.encrypted) throw new Error(`${label}: encrypted ZIP member.`);
+    if (member.method !== 0 && member.method !== 8) throw new Error(`${label}: unsupported ZIP member (method ${member.method}).`);
+    const header = await readRange(path, member.offset, 30, signal);
+    if (u32(header, 0) !== 0x04034b50) throw new Error(`${label}: unreadable ZIP member (no local header).`);
+    const data = await readRange(path, member.offset + 30 + u16(header, 26) + u16(header, 28), member.size, signal);
+    try { documents.push({ file: label, content: (member.method === 0 ? data : inflateRawSync(data, { maxOutputLength: 1_000_000_000 })).toString('utf8') }); }
+    catch (error) { throw new Error(`${label}: unreadable ZIP member: ${error instanceof Error ? error.message : error}`); }
+  }
+  return documents;
+}
 export async function scanChatGPT(input: string, signal?: AbortSignal): Promise<Scan> {
   const path = resolve(input.startsWith('~/') ? join(homedir(), input.slice(2)) : input);
   const info = await stat(path);
@@ -163,11 +233,7 @@ export async function scanChatGPT(input: string, signal?: AbortSignal): Promise<
   if (info.isDirectory()) {
     for (const file of await filesUnder(path, accept, signal)) documents.push({ file, content: await readFile(file, { encoding: 'utf8', signal }) });
   } else if (path.toLowerCase().endsWith('.zip')) {
-    const listing = await exec('unzip', ['-Z1', path], { signal, maxBuffer: 10_000_000 });
-    for (const name of listing.stdout.split('\n').filter(accept)) {
-      const result = await exec('unzip', ['-p', path, name], { signal, maxBuffer: 1_000_000_000 });
-      documents.push({ file: `${path}:${name}`, content: result.stdout });
-    }
+    documents.push(...await readZip(path, accept, signal));
   } else documents.push({ file: path, content: await readFile(path, { encoding: 'utf8', signal }) });
   if (!documents.length) throw new Error('No conversations.json or numbered conversation JSON files found. Select a ChatGPT export ZIP, extracted folder, or JSON file.');
   const conversations: Conversation[] = [], warnings: string[] = [];
