@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { atomicWrite } from './profiles.ts';
+import { atomicWrite } from './memory.ts';
 import { type Memory } from './memory.ts';
 
 // One self-contained, read-only HTML snapshot of a profile's memory.
@@ -82,12 +82,14 @@ function when(a, b) {
   if (lo === hi) return day(x) + ', ' + time(x);
   return x.toDateString() === y.toDateString() ? day(x) + ', ' + time(x) + '–' + time(y) : day(x) + ' ' + time(x) + ' – ' + day(y) + ' ' + time(y);
 }
-const SOURCE = { claude: 'Claude Code', 'claude-memory': 'Claude Code memory', codex: 'Codex', chatgpt: 'ChatGPT' };
+const SOURCE = { claude: 'Claude Code', 'claude-memory': 'Claude Code memory', codex: 'Codex', pi: 'Pi / OMP', chatgpt: 'ChatGPT' };
 // Imported text starts with a "[Historical …]" line for the model; the meta line already says it.
 const body = e => { const j = e.origin && e.text.startsWith('[Historical ') ? e.text.indexOf(']\n') : -1; return j < 0 ? e.text : e.text.slice(j + 2); };
 const short = (s, n) => { s = s.replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
 function who(e) {
-  if (e.kind === 'user') return /^\[[0-9a-f]{6,}\] /.test(e.text) ? ['Subagent', 'work', 'subagent report'] : ['You', 'you', 'from you'];
+  // Logs from before the work kind held reports as user messages starting "[id] "; another extension's shown custom message is tagged the same way.
+  if (e.kind === 'work' || e.kind === 'user' && /^\[[\w.:-]+\] /.test(e.text)) return ['Subagent', 'work', 'subagent report'];
+  if (e.kind === 'user') return ['You', 'you', 'from you'];
   if (e.kind === 'talk') return ['OptChat', 'talk', 'reply'];
   if (e.kind === 'tool') return ['Tool call', 'tool', 'tool step'];
   if (e.kind === 'echo') return ['Tool result', 'tool', 'tool step'];

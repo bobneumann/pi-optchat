@@ -1,13 +1,18 @@
+import { createHash } from 'node:crypto';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
 import { getCurrentSystemMessage, type SystemMessage, type UserMessage } from '@earendil-works/pi-ai';
 import { CAP, cap, type Memory } from './memory.ts';
 import { record } from './cache.ts';
 import { DEFAULT_SETTINGS } from './settings.ts';
+import { imageRef, isImage } from './images.ts';
 
 export const RUN_BOUNDARY = 'optchat.run';
-/** Subagent traffic to the main agent: a custom message on screen, a plain user message to the model and memory. */
+/** Subagent traffic to the main agent: a custom message on screen, a plain user message to the model, `work` in memory. */
 export const REPORT_TYPE = 'optchat-report';
+export const REPORT_RECEIPT = 'report:';
+/** A report's receipt in memory: it marks the entry as `work` and keeps a restart from delivering the report twice. */
+export const reportReceipt = (text: string) => REPORT_RECEIPT + createHash('sha256').update(text).digest('hex');
 
 export function textContent(content: unknown, images = true): string {
   if (typeof content === 'string') return content;
@@ -15,24 +20,34 @@ export function textContent(content: unknown, images = true): string {
   return content.map((part: unknown) => {
     if (typeof part !== 'object' || part === null) return '';
     if ('type' in part && part.type === 'text' && 'text' in part && typeof part.text === 'string') return part.text;
-    if (images && 'type' in part && part.type === 'image') return '[image attachment: available in Pi session; text memory does not preserve image bytes]';
+    if (images && isImage(part)) return imageRef(part);
     return '';
   }).filter(Boolean).join('\n');
 }
-/** What the user typed, as Pi's input event (and so the inbox) saw it: no image placeholders, and without the
+/** What the user typed, as Pi's input event (and so the inbox) saw it: no image references, and without the
  * `[Image …]` notes Pi appends after the text when it resizes, converts or omits an attached image. */
 export function typedText(content: unknown) {
   const text = textContent(content, false);
   return { text, bare: text.replace(/\n\n\[Image[ :][^\n]*\](?:\n\[Image[ :][^\n]*\])*$/, '') };
 }
-/** Reports reach the model, memory and the previous-exchange replay exactly as the user messages they used to be. */
+/** Pi's convertToLlm sends every custom message to the model as a user message. A shown one is part of the chat, so it
+ * becomes a user message here too; another extension's starts with "[customType] ", as the recipe marks background work, so
+ * the compactor never takes it for the user's words. A hidden one (display false), such as context an extension injects
+ * each turn, stays custom: the model still sees it, and memory and the replay leave it out. Reports reach the model and the
+ * previous-exchange replay as user messages; memory logs them as `work`. */
 export function asUser(message: AgentMessage): AgentMessage {
-  if (message.role !== 'custom' || message.customType !== REPORT_TYPE) return message;
-  return { role: 'user', content: textContent(message.content), timestamp: message.timestamp };
+  if (message.role !== 'custom' || !message.display) return message;
+  const { content, customType, timestamp } = message;
+  if (customType === REPORT_TYPE) return { role: 'user', content, timestamp };
+  const tag = `[${customType}] `;
+  if (typeof content === 'string') return { role: 'user', content: tag + content, timestamp };
+  const [first, ...rest] = content;
+  if (first?.type === 'text') return { role: 'user', content: [{ ...first, text: tag + first.text }, ...rest], timestamp };
+  return { role: 'user', content: [{ type: 'text', text: tag.trimEnd() }, ...content], timestamp };
 }
 export function logMessage(memory: Memory, message: AgentMessage, receipt?: string) {
   const date = new Date(message.timestamp).toISOString();
-  if (message.role === 'user') memory.append('user', textContent(message.content), date, receipt);
+  if (message.role === 'user') memory.append(receipt?.startsWith(REPORT_RECEIPT) ? 'work' : 'user', textContent(message.content), date, receipt);
   else if (message.role === 'assistant') {
     for (const block of message.content) {
       if (block.type === 'text' && block.text.trim()) memory.append('talk', block.text, date);
@@ -40,7 +55,9 @@ export function logMessage(memory: Memory, message: AgentMessage, receipt?: stri
     }
     if (message.stopReason === 'error' || message.stopReason === 'aborted')
       memory.append('echo', `Agent ${message.stopReason}: ${message.errorMessage ?? 'No further details'}`, date);
-  } else if (message.role === 'toolResult') memory.append('echo', cap(`${message.toolName}: ${textContent(message.content)}`), date);
+  } else if (message.role === 'toolResult')
+    // A zoom's page already names the images it returns.
+    memory.append('echo', cap(`${message.toolName}: ${textContent(message.content, message.toolName !== 'zoom')}`), date);
 }
 export function boundedMessage(message: AgentMessage): AgentMessage {
   if (message.role !== 'toolResult') return message;
@@ -78,7 +95,7 @@ export function previousExchange(branch: readonly SessionEntry[], limit = PREVIO
 function latestExchange(branch: readonly SessionEntry[]) {
   let end = -1;
   let legacyEnd = branch.length;
-  const messages = (entries: readonly SessionEntry[]) => entries.flatMap(entry => entry.type === 'message' ? [asUser(entry.message)] : entry.type === 'custom_message' && entry.customType === REPORT_TYPE ? [asUser({ role: 'custom', customType: entry.customType, content: entry.content, display: entry.display, timestamp: Date.parse(entry.timestamp) })] : []);
+  const messages = (entries: readonly SessionEntry[]) => entries.flatMap(entry => entry.type === 'message' ? [asUser(entry.message)] : entry.type === 'custom_message' ? [asUser({ role: 'custom', customType: entry.customType, content: entry.content, display: entry.display, timestamp: Date.parse(entry.timestamp) })] : []);
   for (let i = branch.length - 1; i >= 0; i--) {
     const entry = branch[i];
     if (entry.type !== 'custom' || entry.customType !== RUN_BOUNDARY || !record(entry.data)) continue;

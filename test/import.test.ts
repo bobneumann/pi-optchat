@@ -199,6 +199,102 @@ test('Codex discovery and parsing exclude delegated sessions while keeping user 
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+/** Pi and OMP session entries: one id/parentId tree, written in file order. */
+const piSession = (file: string, header: Record<string, unknown>, entries: Record<string, unknown>[]) => {
+  let parentId: string | null = null;
+  lines(file, [{ type: 'session', version: 3, timestamp: date, cwd: '/project', ...header },
+    ...entries.map(e => { const entry = { parentId, timestamp: date, ...e }; parentId = String(e.id); return entry; })]);
+};
+const piMessage = (id: string, message: Record<string, unknown>, parentId?: string) => ({ type: 'message', id, message, ...parentId ? { parentId } : {} });
+const piUser = (id: string, text: string, extra = {}) => piMessage(id, { role: 'user', attribution: 'user', content: [{ type: 'text', text }], ...extra });
+const piReply = (id: string, stopReason: string, content: unknown[], parentId?: string) => piMessage(id, { role: 'assistant', stopReason, content }, parentId);
+
+test('Pi / OMP imports what the user typed and the replies that ended a turn, and marks a rewound branch', async () => {
+  const dir = temp(), file = join(dir, 'session.jsonl');
+  piSession(file, { id: 'session', title: 'Fixture' }, [
+    { type: 'model_change', id: 'm', model: 'anthropic/model' }, { type: 'title_change', id: 't', title: 'RENAMED' },
+    piUser('u1', 'exact user question'),
+    piReply('a1', 'toolUse', [{ type: 'thinking', thinking: 'SECRET REASONING' }, { type: 'text', text: 'intermediate explanation' },
+      { type: 'toolCall', id: 'call-1', name: 'bash', arguments: { command: 'ls' } }]),
+    piMessage('r1', { role: 'toolResult', toolCallId: 'call-1', content: [{ type: 'text', text: 'TOOL OUTPUT' }] }),
+    piMessage('d1', { role: 'developer', attribution: 'agent', content: [{ type: 'text', text: 'RULE REMINDER' }] }),
+    piUser('n1', 'AGENT NUDGE', { attribution: 'agent' }), piUser('s1', 'SYNTHETIC PROMPT', { synthetic: true }),
+    piMessage('f1', { role: 'fileMention', files: [{ path: 'a.ts', content: 'MENTIONED FILE' }] }),
+    { type: 'custom_message', id: 'c1', customType: 'async-result', display: true, content: 'BACKGROUND NOTICE' },
+    piReply('a2', 'stop', [{ type: 'text', text: 'TEXT BEFORE A TOOL' }, { type: 'toolCall', id: 'call-2', name: 'read', arguments: {} }]),
+    piReply('a3', 'stop', [{ type: 'thinking', thinking: 'SECRET REASONING' }, { type: 'text', text: 'final answer' }]),
+    piMessage('b1', { role: 'bashExecution', command: 'git status', output: 'SHELL OUTPUT', exitCode: 0 }),
+    piMessage('b2', { role: 'bashExecution', command: 'cat .env', output: 'PRIVATE OUTPUT', exitCode: 0, excludeFromContext: true }),
+    piMessage('p1', { role: 'pythonExecution', code: 'print(1)', output: 'PYTHON OUTPUT', exitCode: 0 }),
+    // OMP records a skill as its own message; Pi expands it into the user message.
+    { type: 'custom_message', id: 'k1', customType: 'skill-prompt', attribution: 'user', display: true, content: 'SKILL BODY',
+      details: { name: 'grill-me', path: '/skills/grill-me/SKILL.md', args: 'one question at a time', lineCount: 3 } },
+    { type: 'custom_message', id: 'k3', customType: 'skill-prompt', attribution: 'user', display: true, content: 'SKILL BODY',
+      details: { name: 'grill-me', path: '/skills/grill-me/SKILL.md', args: 'the plan', prompt: 'first read this, then /skill:grill-me the plan', lineCount: 3 } },
+    piUser('k2', '<skill name="review" location="/skills/review/SKILL.md">\nSKILL BODY\n</skill>\n\ncheck the PR'),
+    piUser('u2', 'why are you adding redis? I just wanted the refactor'),
+    piReply('a4', 'aborted', [{ type: 'text', text: 'ABORTED REPLY' }]),
+    // The user rewound to a3 and typed again; the branch above stays in the file.
+    piUser('u3', 'do only the refactor'), piReply('a5', 'error', [{ type: 'text', text: 'FAILED REPLY' }]),
+    piReply('a6', 'length', [{ type: 'text', text: 'long answer, cut off' }]),
+    { type: 'compaction', id: 'x', summary: 'COMPACTION SUMMARY' },
+  ]);
+  // Rewire u3 onto a3, as a rewind writes it.
+  const rows = readFileSync(file, 'utf8').trim().split('\n').map(l => JSON.parse(l));
+  rows.find(r => r.id === 'u3').parentId = 'a3';
+  lines(file, rows);
+  try {
+    const parsed = await readConversation(conversation('pi', file));
+    assert.deepEqual(parsed.entries.map(e => [e.kind, body(e)]), [
+      ['user', 'exact user question'], ['talk', 'final answer'],
+      ['user', '[alternate branch]\n!git status'], ['user', '[alternate branch]\n$print(1)'],
+      ['user', '[alternate branch]\n/skill:grill-me one question at a time'], ['user', '[alternate branch]\nfirst read this, then /skill:grill-me the plan'],
+      ['user', '[alternate branch]\n/skill:review check the PR'],
+      ['user', '[alternate branch]\nwhy are you adding redis? I just wanted the refactor'],
+      ['user', 'do only the refactor'], ['talk', 'long answer, cut off']]);
+    assert.doesNotMatch(JSON.stringify(parsed.entries),
+      /SECRET|intermediate|TOOL OUTPUT|TEXT BEFORE|REMINDER|NUDGE|SYNTHETIC|MENTIONED|BACKGROUND|OUTPUT|SKILL BODY|ABORTED|FAILED|COMPACTION|RENAMED/);
+    assert.deepEqual(parsed.warnings, []);
+    assert.equal(parsed.entries[0].text.split('\n')[0], `[Historical pi · 2026-01-02 12:00Z · conversation- · Fixture]`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a Pi / OMP fork adds only its new messages, though it copies the earlier ones under a new session id', async () => {
+  const dir = temp(), original = join(dir, 'original.jsonl'), fork = join(dir, 'fork.jsonl');
+  const earlier = [piUser('u1', 'first question'), piReply('a1', 'stop', [{ type: 'text', text: 'first answer' }])];
+  piSession(original, { id: 'original' }, earlier);
+  piSession(fork, { id: 'fork', parentSession: original }, [...earlier, piUser('u2', 'question on the fork')]);
+  try {
+    const read = async (file: string, id: string) => (await readConversation({ ...conversation('pi', file), id })).entries;
+    const { added, skipped } = deduplicate([], [...await read(original, 'original'), ...await read(fork, 'fork')]);
+    assert.deepEqual(added.map(body), ['first question', 'first answer', 'question on the fork']);
+    assert.equal(skipped, 2);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('Pi / OMP discovery skips sessions that ran under OptChat and the subagent logs stored beside a session', async () => {
+  const root = temp(), project = join(root, '--work-alpha--'), stem = '2026-01-02T12-00-00-000Z_alpha';
+  mkdirSync(join(project, stem), { recursive: true });
+  const typed = (text: string, attribution = 'user') => ({ ...piUser(text, text, { attribution }), timestamp: '2026-01-02T12:05:00.000Z' });
+  lines(join(project, `${stem}.jsonl`), [{ type: 'title', v: 1, title: 'Current title' }, { type: 'session', version: 3, id: 'alpha', timestamp: date, cwd: '/work/alpha', title: 'Header title' }, typed('first request')]);
+  piSession(join(project, 'beta.jsonl'), { id: 'beta', cwd: '/work/beta', title: 'Header title' }, [typed('typed request')]);
+  piSession(join(project, 'gamma.jsonl'), { id: 'gamma', cwd: '/work/gamma' }, [typed('reminder', 'agent'), typed('typed request')]);
+  piSession(join(project, 'delta.jsonl'), { id: 'delta', cwd: '/work/delta' }, [typed('typed request'), ...Array.from({ length: 70 }, (_, i) => typed(`message ${i}`)),
+    { type: 'session_info', id: 'n1', name: 'First name' }, { type: 'session_info', id: 'n2', name: 'Named in Pi' }]);
+  piSession(join(project, stem, 'Scout.jsonl'), { id: 'child' }, [typed('delegated task')]);
+  // OptChat binds its profile when the session starts, or later in a session that began without it.
+  piSession(join(project, 'optchat.jsonl'), { id: 'optchat' }, [...Array.from({ length: 80 }, (_, i) => typed(`message ${i}`)),
+    { type: 'custom', id: 'o', customType: 'optchat.profile', data: { profile: 'work' } }]);
+  try {
+    const scan = await scanLocal('pi', [root]);
+    assert.deepEqual(scan.conversations.map(c => [c.id, c.project, c.title]).sort(), [
+      ['alpha', '/work/alpha', 'Current title'], ['beta', '/work/beta', 'Header title'], ['delta', '/work/delta', 'Named in Pi'], ['gamma', '/work/gamma', 'typed request']]);
+    assert.ok(scan.conversations.every(c => c.date === '2026-01-02T12:05:00.000Z'), 'the start is the first message the user typed');
+    assert.match(scan.note ?? '', /^1 session ran under OptChat/);
+    assert.deepEqual(scan.warnings, []);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('ChatGPT keeps user messages and final replies on each branch with stable identities', async () => {
   const dir = temp(), file = join(dir, 'conversations-1.json');
   const exported = { id: 'chat-1', title: 'Branches', create_time: 100, update_time: 300, current_node: 'final', mapping: {
@@ -429,7 +525,7 @@ test('append activates only after complete indexing, retains original summaries,
   let activated: Memory | undefined;
   try {
     old.append('user', 'original exact message', '2026-06-01T00:00:00.000Z');
-    await old.settle(undefined, true); await old.close();
+    await old.settle(undefined, 'tree'); await old.close();
     const original = old.node({ l: 0, i: 0 });
     const job = prepareImport(dir, old, [entry('one'), entry('one')], 'append'); assert.ok(job);
     assert.equal(job.added, 1); assert.equal(job.skipped, 1); assert.equal(memoryDirectory(dir), dir);
@@ -450,7 +546,7 @@ test('paused imports retain completed summaries, resume from disk, and preserve 
   const dir = temp(); const old = new Memory(dir, short);
   let current: Memory | undefined;
   try {
-    old.append('user', 'native later', '2026-06-01T00:00:00.000Z'); await old.settle(undefined, true); await old.close();
+    old.append('user', 'native later', '2026-06-01T00:00:00.000Z'); await old.settle(undefined, 'tree'); await old.close();
     prepareImport(dir, old, [entry('a'), entry('b', date, 'large '.repeat(200))], 'rebuild');
     await assert.rejects(runImport(dir, async (_input, signal) => {
       await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
@@ -470,7 +566,7 @@ test('paused imports retain completed summaries, resume from disk, and preserve 
 test('discard leaves original memory active and a completed pointer swap can finish recovery idempotently', async () => {
   const dir = temp(), old = new Memory(dir, short);
   try {
-    old.append('user', 'original'); await old.settle(undefined, true); await old.close();
+    old.append('user', 'original'); await old.settle(undefined, 'tree'); await old.close();
     const discarded = prepareImport(dir, old, [entry('discard')], 'append'); assert.ok(discarded);
     discardImport(dir); assert.equal(memoryDirectory(dir), dir); assert.equal(pendingImport(dir), undefined);
     const job = prepareImport(dir, old, [entry('keep')], 'append'); assert.ok(job);
@@ -492,7 +588,7 @@ test('an import gives the compactor the same inputs as a live chat that sent the
   // 300 lines of 500 bytes overflow the view, so merges run while later messages still wait to be summarized.
   const dir = temp(), live = temp(), old = new Memory(dir, short);
   const imported = Array.from({ length: 300 }, (_, i) => entry(`m${i}`, date, `${i} ${'imported detail '.repeat(40)}`));
-  const record = (calls: string[]) => async (input: Parameters<Compressor>[0]) => { calls.push(JSON.stringify([input.merge, input.historical, input.source, input.context])); return input.source.slice(0, 500); };
+  const record = (calls: string[]) => async (input: Parameters<Compressor>[0]) => { calls.push(JSON.stringify([input.part.l > 0, input.historical, input.source, input.context])); return input.source.slice(0, 500); };
   const fromImport: string[] = [], fromChat: string[] = [];
   let chat: Memory | undefined;
   try {
@@ -501,16 +597,29 @@ test('an import gives the compactor the same inputs as a live chat that sent the
     await runImport(dir, record(fromImport), AbortSignal.timeout(20000));
     chat = new Memory(live, record(fromChat), () => {});
     for (const e of imported) { chat.append(e.kind, e.text, e.date, e.receipt, e.origin); await chat.settle(AbortSignal.timeout(20000)); }
-    await chat.settle(AbortSignal.timeout(20000), true);
+    await chat.settle(AbortSignal.timeout(20000), 'tree');
     assert.ok(fromChat.some(call => call.startsWith('[true')), 'the view overflowed and merged');
     assert.deepEqual(fromImport.sort(), fromChat.sort());
   } finally { await chat?.close(); rmSync(dir, { recursive: true, force: true }); rmSync(live, { recursive: true, force: true }); }
 });
 
+test('append keeps the saved view with the tree, so the old view stays cached; rebuild starts without one', async () => {
+  const dir = temp(), old = new Memory(dir, short);
+  try {
+    old.append('user', 'original'); await old.settle(undefined, 'tree'); await old.close();
+    writeFileSync(join(dir, 'view.json'), '[[0,0]]');
+    const appended = prepareImport(dir, old, [entry('a')], 'append'); assert.ok(appended);
+    assert.equal(readFileSync(join(dir, appended.target, 'view.json'), 'utf8'), '[[0,0]]');
+    discardImport(dir);
+    const rebuilt = prepareImport(dir, old, [entry('b')], 'rebuild'); assert.ok(rebuilt);
+    assert.equal(existsSync(join(dir, rebuilt.target, 'view.json')), false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('a staged plan with an invalid entry, or missing lines, is refused before anything is written', async () => {
   const dir = temp(), old = new Memory(dir, short);
   try {
-    old.append('user', 'original'); await old.settle(undefined, true); await old.close();
+    old.append('user', 'original'); await old.settle(undefined, 'tree'); await old.close();
     const job = prepareImport(dir, old, [entry('a'), entry('b'), entry('c')], 'append'); assert.ok(job);
     const staged = join(dir, job.target, 'staged.jsonl'), plan = readFileSync(staged, 'utf8'), lines = plan.split('\n').filter(Boolean);
     const damaged = {

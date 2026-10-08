@@ -1,10 +1,11 @@
 import { createHash } from 'node:crypto';
-import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync, type Stats } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync, type Stats } from 'node:fs';
 import { createConnection, createServer } from 'node:net';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { ModelChoice } from './compactor.ts';
 import { record } from './cache.ts';
+import { atomicWrite } from './memory.ts';
 import { DEFAULT_SETTINGS, readSettings, type Settings } from './settings.ts';
 
 export const isWindows = process.platform === 'win32';
@@ -25,16 +26,6 @@ export function profilePath(name: string) {
 export function listProfiles() {
   const root = join(dataHome(), 'profiles');
   return existsSync(root) ? readdirSync(root, { withFileTypes: true }).filter(f => f.isDirectory() && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(f.name)).map(f => f.name).sort() : [];
-}
-export function atomicWrite(file: string, text: string) {
-  const parent = resolve(file, '..');
-  mkdirSync(parent, { recursive: true, mode: 0o700 });
-  const temporary = `${file}.${process.pid}.tmp`;
-  // 'w+' because Windows refuses fsync on a write-only handle, and it cannot open a directory at all, so the file flush is the whole durability guarantee there.
-  const fd = openSync(temporary, 'w+', 0o600);
-  try { writeSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
-  renameSync(temporary, file);
-  if (!isWindows) { const dir = openSync(parent, 'r'); try { fsyncSync(dir); } finally { closeSync(dir); } }
 }
 export function createProfile(name: string) {
   const dir = profilePath(name);
