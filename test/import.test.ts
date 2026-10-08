@@ -198,6 +198,102 @@ test('Codex discovery and parsing exclude delegated sessions while keeping user 
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+/** Pi and OMP session entries: one id/parentId tree, written in file order. */
+const piSession = (file: string, header: Record<string, unknown>, entries: Record<string, unknown>[]) => {
+  let parentId: string | null = null;
+  lines(file, [{ type: 'session', version: 3, timestamp: date, cwd: '/project', ...header },
+    ...entries.map(e => { const entry = { parentId, timestamp: date, ...e }; parentId = String(e.id); return entry; })]);
+};
+const piMessage = (id: string, message: Record<string, unknown>, parentId?: string) => ({ type: 'message', id, message, ...parentId ? { parentId } : {} });
+const piUser = (id: string, text: string, extra = {}) => piMessage(id, { role: 'user', attribution: 'user', content: [{ type: 'text', text }], ...extra });
+const piReply = (id: string, stopReason: string, content: unknown[], parentId?: string) => piMessage(id, { role: 'assistant', stopReason, content }, parentId);
+
+test('Pi / OMP imports what the user typed and the replies that ended a turn, and marks a rewound branch', async () => {
+  const dir = temp(), file = join(dir, 'session.jsonl');
+  piSession(file, { id: 'session', title: 'Fixture' }, [
+    { type: 'model_change', id: 'm', model: 'anthropic/model' }, { type: 'title_change', id: 't', title: 'RENAMED' },
+    piUser('u1', 'exact user question'),
+    piReply('a1', 'toolUse', [{ type: 'thinking', thinking: 'SECRET REASONING' }, { type: 'text', text: 'intermediate explanation' },
+      { type: 'toolCall', id: 'call-1', name: 'bash', arguments: { command: 'ls' } }]),
+    piMessage('r1', { role: 'toolResult', toolCallId: 'call-1', content: [{ type: 'text', text: 'TOOL OUTPUT' }] }),
+    piMessage('d1', { role: 'developer', attribution: 'agent', content: [{ type: 'text', text: 'RULE REMINDER' }] }),
+    piUser('n1', 'AGENT NUDGE', { attribution: 'agent' }), piUser('s1', 'SYNTHETIC PROMPT', { synthetic: true }),
+    piMessage('f1', { role: 'fileMention', files: [{ path: 'a.ts', content: 'MENTIONED FILE' }] }),
+    { type: 'custom_message', id: 'c1', customType: 'async-result', display: true, content: 'BACKGROUND NOTICE' },
+    piReply('a2', 'stop', [{ type: 'text', text: 'TEXT BEFORE A TOOL' }, { type: 'toolCall', id: 'call-2', name: 'read', arguments: {} }]),
+    piReply('a3', 'stop', [{ type: 'thinking', thinking: 'SECRET REASONING' }, { type: 'text', text: 'final answer' }]),
+    piMessage('b1', { role: 'bashExecution', command: 'git status', output: 'SHELL OUTPUT', exitCode: 0 }),
+    piMessage('b2', { role: 'bashExecution', command: 'cat .env', output: 'PRIVATE OUTPUT', exitCode: 0, excludeFromContext: true }),
+    piMessage('p1', { role: 'pythonExecution', code: 'print(1)', output: 'PYTHON OUTPUT', exitCode: 0 }),
+    // OMP records a skill as its own message; Pi expands it into the user message.
+    { type: 'custom_message', id: 'k1', customType: 'skill-prompt', attribution: 'user', display: true, content: 'SKILL BODY',
+      details: { name: 'grill-me', path: '/skills/grill-me/SKILL.md', args: 'one question at a time', lineCount: 3 } },
+    { type: 'custom_message', id: 'k3', customType: 'skill-prompt', attribution: 'user', display: true, content: 'SKILL BODY',
+      details: { name: 'grill-me', path: '/skills/grill-me/SKILL.md', args: 'the plan', prompt: 'first read this, then /skill:grill-me the plan', lineCount: 3 } },
+    piUser('k2', '<skill name="review" location="/skills/review/SKILL.md">\nSKILL BODY\n</skill>\n\ncheck the PR'),
+    piUser('u2', 'why are you adding redis? I just wanted the refactor'),
+    piReply('a4', 'aborted', [{ type: 'text', text: 'ABORTED REPLY' }]),
+    // The user rewound to a3 and typed again; the branch above stays in the file.
+    piUser('u3', 'do only the refactor'), piReply('a5', 'error', [{ type: 'text', text: 'FAILED REPLY' }]),
+    piReply('a6', 'length', [{ type: 'text', text: 'long answer, cut off' }]),
+    { type: 'compaction', id: 'x', summary: 'COMPACTION SUMMARY' },
+  ]);
+  // Rewire u3 onto a3, as a rewind writes it.
+  const rows = readFileSync(file, 'utf8').trim().split('\n').map(l => JSON.parse(l));
+  rows.find(r => r.id === 'u3').parentId = 'a3';
+  lines(file, rows);
+  try {
+    const parsed = await readConversation(conversation('pi', file));
+    assert.deepEqual(parsed.entries.map(e => [e.kind, body(e)]), [
+      ['user', 'exact user question'], ['talk', 'final answer'],
+      ['user', '[alternate branch]\n!git status'], ['user', '[alternate branch]\n$print(1)'],
+      ['user', '[alternate branch]\n/skill:grill-me one question at a time'], ['user', '[alternate branch]\nfirst read this, then /skill:grill-me the plan'],
+      ['user', '[alternate branch]\n/skill:review check the PR'],
+      ['user', '[alternate branch]\nwhy are you adding redis? I just wanted the refactor'],
+      ['user', 'do only the refactor'], ['talk', 'long answer, cut off']]);
+    assert.doesNotMatch(JSON.stringify(parsed.entries),
+      /SECRET|intermediate|TOOL OUTPUT|TEXT BEFORE|REMINDER|NUDGE|SYNTHETIC|MENTIONED|BACKGROUND|OUTPUT|SKILL BODY|ABORTED|FAILED|COMPACTION|RENAMED/);
+    assert.deepEqual(parsed.warnings, []);
+    assert.equal(parsed.entries[0].text.split('\n')[0], `[Historical pi · 2026-01-02 12:00Z · conversation- · Fixture]`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a Pi / OMP fork adds only its new messages, though it copies the earlier ones under a new session id', async () => {
+  const dir = temp(), original = join(dir, 'original.jsonl'), fork = join(dir, 'fork.jsonl');
+  const earlier = [piUser('u1', 'first question'), piReply('a1', 'stop', [{ type: 'text', text: 'first answer' }])];
+  piSession(original, { id: 'original' }, earlier);
+  piSession(fork, { id: 'fork', parentSession: original }, [...earlier, piUser('u2', 'question on the fork')]);
+  try {
+    const read = async (file: string, id: string) => (await readConversation({ ...conversation('pi', file), id })).entries;
+    const { added, skipped } = deduplicate([], [...await read(original, 'original'), ...await read(fork, 'fork')]);
+    assert.deepEqual(added.map(body), ['first question', 'first answer', 'question on the fork']);
+    assert.equal(skipped, 2);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('Pi / OMP discovery skips sessions that ran under OptChat and the subagent logs stored beside a session', async () => {
+  const root = temp(), project = join(root, '--work-alpha--'), stem = '2026-01-02T12-00-00-000Z_alpha';
+  mkdirSync(join(project, stem), { recursive: true });
+  const typed = (text: string, attribution = 'user') => ({ ...piUser(text, text, { attribution }), timestamp: '2026-01-02T12:05:00.000Z' });
+  lines(join(project, `${stem}.jsonl`), [{ type: 'title', v: 1, title: 'Current title' }, { type: 'session', version: 3, id: 'alpha', timestamp: date, cwd: '/work/alpha', title: 'Header title' }, typed('first request')]);
+  piSession(join(project, 'beta.jsonl'), { id: 'beta', cwd: '/work/beta', title: 'Header title' }, [typed('typed request')]);
+  piSession(join(project, 'gamma.jsonl'), { id: 'gamma', cwd: '/work/gamma' }, [typed('reminder', 'agent'), typed('typed request')]);
+  piSession(join(project, 'delta.jsonl'), { id: 'delta', cwd: '/work/delta' }, [typed('typed request'), ...Array.from({ length: 70 }, (_, i) => typed(`message ${i}`)),
+    { type: 'session_info', id: 'n1', name: 'First name' }, { type: 'session_info', id: 'n2', name: 'Named in Pi' }]);
+  piSession(join(project, stem, 'Scout.jsonl'), { id: 'child' }, [typed('delegated task')]);
+  // OptChat binds its profile when the session starts, or later in a session that began without it.
+  piSession(join(project, 'optchat.jsonl'), { id: 'optchat' }, [...Array.from({ length: 80 }, (_, i) => typed(`message ${i}`)),
+    { type: 'custom', id: 'o', customType: 'optchat.profile', data: { profile: 'work' } }]);
+  try {
+    const scan = await scanLocal('pi', [root]);
+    assert.deepEqual(scan.conversations.map(c => [c.id, c.project, c.title]).sort(), [
+      ['alpha', '/work/alpha', 'Current title'], ['beta', '/work/beta', 'Header title'], ['delta', '/work/delta', 'Named in Pi'], ['gamma', '/work/gamma', 'typed request']]);
+    assert.ok(scan.conversations.every(c => c.date === '2026-01-02T12:05:00.000Z'), 'the start is the first message the user typed');
+    assert.match(scan.note ?? '', /^1 session ran under OptChat/);
+    assert.deepEqual(scan.warnings, []);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('ChatGPT keeps user messages and final replies on each branch with stable identities', async () => {
   const dir = temp(), file = join(dir, 'conversations-1.json');
   const exported = { id: 'chat-1', title: 'Branches', create_time: 100, update_time: 300, current_node: 'final', mapping: {
