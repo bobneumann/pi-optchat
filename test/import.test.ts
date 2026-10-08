@@ -533,6 +533,12 @@ test('append activates only after complete indexing, retains original summaries,
     assert.match(activated.zoom(1, 1), /Imported one/);
     assert.deepEqual(deduplicate(activated.root, [entry('one')]), { added: [], skipped: 1 });
     assert.ok(existsSync(join(dir, 'main')));
+    // A second import starts from the generation the first one made, which the journal names as a portable path.
+    await activated.close();
+    prepareImport(dir, activated, [entry('two')], 'append');
+    await runImport(dir, short, AbortSignal.timeout(5000));
+    activated = new Memory(memoryDirectory(dir), short);
+    assert.deepEqual(activated.root.map(e => e.receipt).slice(1), ['import:one', 'import:two']);
   } finally { await old.close(); await activated?.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
