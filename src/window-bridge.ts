@@ -7,9 +7,9 @@ import { checkSocketPath, profileSocket, removeStaleSocket } from './profiles.ts
 import { textContent } from './transcript.ts';
 import { isActiveRun } from './runs.ts';
 
-type Action = 'start' | 'say' | 'tell-main' | 'complete';
+type Action = 'start' | 'say' | 'tell-main' | 'answer' | 'complete';
 interface Request { kind: 'request'; id: number; action: Action; text?: string; cwd?: string }
-interface Reply { kind: 'reply'; id: number; error?: string }
+interface Reply { kind: 'reply'; id: number; error?: string; text?: string }
 /** A tool the subagent is running right now, with its streamed output so far. */
 export interface LiveTool { id: string; name: string; args: unknown; output?: unknown; started: number }
 /** What the subagent is doing between finished messages: its streaming reply and running tools. */
@@ -36,13 +36,16 @@ function parse(value: unknown): Frame {
     return { kind: 'event', name, text: value.text, from: from === 'user' || from === 'agent' ? from : undefined,
       message: isMessage(value.message) ? value.message : undefined, live: isLive(value.live) ? value.live : undefined };
   if (typeof value.id !== 'number' || !Number.isSafeInteger(value.id)) throw new Error('Invalid request ID');
-  if (value.kind === 'reply' && (value.error === undefined || typeof value.error === 'string')) return { kind: 'reply', id: value.id, error: value.error };
-  if (value.kind === 'request' && (action === 'start' || action === 'say' || action === 'tell-main' || action === 'complete')
+  if (value.kind === 'reply' && (value.error === undefined || typeof value.error === 'string') && (value.text === undefined || typeof value.text === 'string'))
+    return { kind: 'reply', id: value.id, error: value.error, text: value.text };
+  if (value.kind === 'request' && (action === 'start' || action === 'say' || action === 'tell-main' || action === 'answer' || action === 'complete')
     && (value.text === undefined || typeof value.text === 'string') && (value.cwd === undefined || typeof value.cwd === 'string'))
     return { kind: 'request', id: value.id, action, text: value.text, cwd: value.cwd };
   throw new Error('Invalid window message');
 }
 const SHORTENED = '\n[Display shortened; full text is saved in the transcript.]';
+/** Stays under the 4 MB frame bound even when JSON escapes some characters. */
+const ANSWER_LIMIT = 1_000_000;
 const shorten = (text: string, limit: number) => text.length > limit ? `${text.slice(0, limit)}${SHORTENED}` : text;
 /** Long text parts are cut and images dropped: the window only draws them, the owner keeps the full transcript. */
 function clipContent(content: unknown): unknown {
@@ -110,6 +113,12 @@ export async function serveWindows(directory: string, children: Children, availa
             send({ kind: 'event', name: 'started', text: child });
           } else {
             if (!child) throw new Error('Send your first request to start a conversation');
+            if (frame.action === 'answer') {
+              // The agent's last reply in full, not the display copy that events carry (headless `pi -p` prints it).
+              const text = children.live(child)?.session.getLastAssistantText() ?? '';
+              if (text.length > ANSWER_LIMIT) throw new Error(`The reply is over ${ANSWER_LIMIT.toLocaleString('en')} characters; the original Pi window has it in full`);
+              send({ kind: 'reply', id: frame.id, text }); return;
+            }
             if (frame.action === 'complete') {
               const live = children.live(child);
               if (live) drainMessages(live.session.messages, live.info.task);
@@ -149,7 +158,8 @@ export async function serveWindows(directory: string, children: Children, availa
       let state: LiveState = { state: info.state, model: info.model,
         streaming: live?.streaming?.role === 'assistant' ? clip(live.streaming) : undefined,
         tools: live ? [...live.tools].map(([id, t]) => ({ id, name: t.name, args: t.args, output: clipOutput(t.output), started: t.started })) : [],
-        agents: [...children.history.records.values()].filter(run => run.parentId === child && isActiveRun(run)).length };
+        // A finished child counts until its report has reached this agent, so the agent never looks idle in between.
+        agents: [...children.history.records.values()].filter(run => run.parentId === child && (isActiveRun(run) || children.live(run.id))).length };
       if (!fits(state)) state = { ...state, streaming: undefined, tools: state.tools.map(t => ({ ...t, args: {}, output: undefined })) };
       const status = JSON.stringify(state);
       if (status !== lastStatus) { lastStatus = status; send({ kind: 'event', name: 'status', text, live: state }); }
@@ -180,13 +190,13 @@ export async function serveWindows(directory: string, children: Children, availa
 export async function connectWindow(directory: string, event: (event: WindowEvent) => void, disconnected: () => void) {
   const socket = createConnection(profileSocket(directory, 'windows'));
   let next = 0;
-  const pending = new Map<number, { resolve: () => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
+  const pending = new Map<number, { resolve: (text?: string) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
   const send = wire(socket, frame => {
     if (frame.kind === 'event') { event(frame); return; }
     if (frame.kind !== 'reply') { socket.destroy(); return; }
     const request = pending.get(frame.id); if (!request) return;
     clearTimeout(request.timer); pending.delete(frame.id);
-    if (frame.error) request.reject(new Error(frame.error)); else request.resolve();
+    if (frame.error) request.reject(new Error(frame.error)); else request.resolve(frame.text);
   });
   socket.on('close', () => {
     for (const request of pending.values()) { clearTimeout(request.timer); request.reject(new Error('Connection to the original Pi window was lost')); }
@@ -202,11 +212,50 @@ export async function connectWindow(directory: string, event: (event: WindowEven
       if (socket.destroyed) throw new Error('The original Pi window is disconnected');
       if (text && text.length > 256_000) throw new Error('Connected-window messages are limited to 256,000 characters');
       const id = next++;
-      await new Promise<void>((resolve, reject) => {
+      return await new Promise<string | undefined>((resolve, reject) => {
         const timer = setTimeout(() => { pending.delete(id); reject(new Error('Owner response timed out; closing this connection')); socket.destroy(); }, 120_000);
         pending.set(id, { resolve, reject, timer }); send({ kind: 'request', id, action, text, cwd });
       });
     },
     close() { socket.destroy(); },
+  };
+}
+
+/**
+ * A headless run (`pi -p`) on a profile another Pi owns: one request to a connected subagent, its final reply,
+ * then `complete`, so the main agent gets the handoff. Connects up front, so a missing session fails before the prompt.
+ */
+export async function joinHeadless(directory: string) {
+  let last: AgentMessage | undefined;
+  let settle: (outcome: { ended?: string; lost?: true }) => void = () => {};
+  const outcome = new Promise<{ ended?: string; lost?: true }>(resolve => { settle = resolve; });
+  const connection = await connectWindow(directory, event => {
+    if (event.name === 'message' && event.from === 'agent') last = event.message;
+    // Waiting with no agents of its own means the agent is waiting for its user: the reply is done. A paused agent
+    // waits for the owner's user instead, and a finished one ends with `finished` once its last messages are sent.
+    else if (event.name === 'status' && event.live?.state === 'waiting' && !event.live.agents) settle({});
+    else if (event.name === 'finished') settle({ ended: event.text });
+  }, () => settle({ lost: true })).catch((error: unknown) => {
+    const code = record(error) ? error.code : undefined;
+    throw code === 'ENOENT' || code === 'ECONNREFUSED' ? new Error('No running OptChat session on this profile to join') : error;
+  });
+  let asked = false;
+  return {
+    async ask(text: string, cwd: string) {
+      if (asked) throw new Error('A headless run joins for one request');
+      asked = true;
+      await connection.request('start', text, cwd);
+      const { ended, lost } = await outcome;
+      const reply = last;
+      if (reply?.role === 'assistant' && (reply.stopReason === 'error' || reply.stopReason === 'aborted')) throw new Error(reply.errorMessage ?? `Request ${reply.stopReason}`);
+      if (lost) throw new Error('Connection to the original Pi window was lost');
+      if (ended !== undefined) throw new Error(`The conversation ended before a reply: ${ended}`);
+      // Events carry display copies cut for length, so the reply itself is fetched whole.
+      const answer = await connection.request('answer') ?? '';
+      await connection.request('complete');
+      connection.close();
+      return answer;
+    },
+    close() { connection.close(); },
   };
 }
