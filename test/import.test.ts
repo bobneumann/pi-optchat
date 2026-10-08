@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
-import { deflateRawSync } from 'node:zlib';
+import { crc32, deflateRawSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { Memory, localDay, type Compressor } from '../src/memory.ts';
@@ -430,21 +430,19 @@ test('a selected transcript disappearing warns without importing it; cancellatio
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-const CRC32 = Array.from({ length: 256 }, (_, i) => { let c = i; for (let n = 0; n < 8; n++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0; });
-const crc32 = (data: Buffer) => { let c = 0xffffffff; for (const b of data) c = CRC32[(c ^ b) & 0xff] ^ (c >>> 1); return c >>> 0; };
-/** The ZIP fixture, built as bytes: local headers, member data, central directory, EOCD. No external binary. */
-const zipArchive = (members: { name: string; data: Buffer; method?: number }[]) => {
+/** The ZIP fixture, built as bytes (local headers, data, central directory, EOCD), so no `zip` binary is needed. `crc` overrides the real CRC-32 to fake corruption. */
+const zipArchive = (members: { name: string; data: Buffer; stored?: boolean; crc?: number }[]) => {
   const parts: Buffer[] = [], central: Buffer[] = [];
   let offset = 0;
   for (const m of members) {
-    const method = m.method ?? 8, data = method === 8 ? deflateRawSync(m.data) : m.data, name = Buffer.from(m.name), crc = crc32(data);
+    const method = m.stored ? 0 : 8, data = m.stored ? m.data : deflateRawSync(m.data), name = Buffer.from(m.name), crc = m.crc ?? crc32(m.data);
     const local = Buffer.alloc(30);
     local.writeUInt32LE(0x04034b50, 0); local.writeUInt16LE(20, 4); local.writeUInt16LE(method, 8);
-    local.writeUInt32LE(crc, 14); local.writeUInt32LE(data.length, 16); local.writeUInt32LE(data.length, 20); local.writeUInt16LE(name.length, 26);
+    local.writeUInt32LE(crc, 14); local.writeUInt32LE(data.length, 18); local.writeUInt32LE(m.data.length, 22); local.writeUInt16LE(name.length, 26);
     parts.push(local, name, data);
     const record = Buffer.alloc(46);
     record.writeUInt32LE(0x02014b50, 0); record.writeUInt16LE(20, 4); record.writeUInt16LE(20, 6); record.writeUInt16LE(method, 10);
-    record.writeUInt32LE(crc, 16); record.writeUInt32LE(data.length, 20); record.writeUInt32LE(data.length, 24);
+    record.writeUInt32LE(crc, 16); record.writeUInt32LE(data.length, 20); record.writeUInt32LE(m.data.length, 24);
     record.writeUInt16LE(name.length, 28); record.writeUInt32LE(offset, 42);
     central.push(record, name);
     offset += 30 + name.length + data.length;
@@ -470,22 +468,18 @@ test('ChatGPT ZIP reads numbered conversation files without extracting other arc
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('the ZIP reader decodes stored and deflated members alike, and never reads a member it does not accept', async () => {
-  const dir = temp(), zip = join(dir, 'export.zip');
-  // Method 9 is unsupported, so a clean scan proves the reader skipped the member accept() rejects.
-  writeFileSync(zip, zipArchive([
-    { name: 'conversations_1.json', data: chatJson('stored-chat', 'stored member message'), method: 0 },
-    { name: 'conversations_2.json', data: chatJson('deflated-chat', 'deflated member message') },
-    { name: 'other.json', data: Buffer.from('not deflated'), method: 9 },
-  ]));
-  writeFileSync(join(dir, 'bad.zip'), zipArchive([{ name: 'conversations_3.json', data: Buffer.from('not deflated'), method: 9 }]));
-  writeFileSync(join(dir, 'not-a-zip.zip'), Buffer.from('not a zip at all'));
+test('a ChatGPT ZIP reads stored and deflated members, and refuses a corrupt member or a file that is not a ZIP', async () => {
+  const dir = temp(), zip = join(dir, 'export.zip'), corrupt = join(dir, 'corrupt.zip'), fake = join(dir, 'fake.zip');
+  const stored = chatJson('stored-chat', 'stored member message'), deflated = chatJson('deflated-chat', 'deflated member message');
+  writeFileSync(zip, zipArchive([{ name: 'conversations_1.json', data: stored, stored: true }, { name: 'export/conversations_2.json', data: deflated }]));
+  writeFileSync(corrupt, zipArchive([{ name: 'conversations.json', data: stored, crc: (crc32(stored) ^ 1) >>> 0 }]));
+  writeFileSync(fake, 'not a zip at all');
   try {
     const scan = await scanChatGPT(zip);
-    assert.deepEqual(scan.conversations.map(c => c.id).sort(), ['deflated-chat', 'stored-chat']);
-    for (const c of scan.conversations) assert.match((await readConversation(c)).entries[0].text, /stored member message|deflated member message/);
-    await assert.rejects(scanChatGPT(join(dir, 'bad.zip')), /conversations_3\.json: unsupported ZIP member \(method 9\)/);
-    await assert.rejects(scanChatGPT(join(dir, 'not-a-zip.zip')), /no end-of-central-directory record/);
+    assert.deepEqual(scan.conversations.map(c => [c.id, c.file]).sort(), [[`deflated-chat`, `${zip}:export/conversations_2.json`], ['stored-chat', `${zip}:conversations_1.json`]]);
+    for (const c of scan.conversations) assert.deepEqual(c.exported, JSON.parse(String(c.id === 'stored-chat' ? stored : deflated))[0]);
+    await assert.rejects(scanChatGPT(corrupt), /Could not read conversations\.json in .*Extract the ZIP and select the folder instead\./);
+    await assert.rejects(scanChatGPT(fake), /Could not read .*fake\.zip: .*Extract the ZIP and select the folder instead\./);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

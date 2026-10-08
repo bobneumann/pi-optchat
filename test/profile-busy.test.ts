@@ -1,6 +1,6 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -130,6 +130,16 @@ test('a regular file named like the lock socket is refused, not deleted', async 
     await assert.rejects(lockProfile(dir, 'holder'), /is not an OptChat socket/);
     assert.equal(readFileSync(profileSocket(dir), 'utf8'), 'notes');
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('on Windows, another spelling of the same profile (casing or a junction) finds the same lock', async (t) => {
+  if (!isWindows) return t.skip('POSIX keeps the socket file inside the profile, so every spelling already reaches it');
+  const root = mkdtempSync(join(tmpdir(), 'optchat-alias-')), dir = join(root, 'Profile'), junction = join(root, 'link');
+  mkdirSync(dir); symlinkSync(dir, junction, 'junction');
+  const unlock = await lockProfile(dir, 'holder');
+  try {
+    for (const alias of [dir.toUpperCase(), junction]) await assert.rejects(lockProfile(alias, 'second'), /Profile already running: holder/);
+  } finally { await unlock(); rmSync(root, { recursive: true, force: true }); }
 });
 
 test('a socket path over the system limit names OPTCHAT_HOME and its length without binding a truncated socket, and one at the limit locks', async () => {

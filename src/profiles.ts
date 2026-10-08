@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync, type Stats } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync, writeFileSync, type Stats } from 'node:fs';
 import { createConnection, createServer } from 'node:net';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -58,7 +58,9 @@ export class ProfileBusyError extends Error {
 /** POSIX keeps a socket file in the profile itself, so every Pi on the profile finds the same one whatever its TMPDIR, and Git skips it. Windows has no Unix sockets, so the profile path is hashed into a named pipe in the machine-wide pipe namespace. */
 export function profileSocket(dir: string, purpose: 'lock' | 'windows' = 'lock') {
   if (!isWindows) return join(dir, `${purpose}.sock`);
-  return `${PIPE_PREFIX}optchat-${createHash('sha256').update(resolve(dir)).digest('hex').slice(0, 16)}-${purpose}`;
+  // Hash the directory's real identity, so another casing, a junction or a symlink to the same profile finds the same pipe.
+  let identity = resolve(dir); try { identity = realpathSync.native(identity); } catch {}
+  return `${PIPE_PREFIX}optchat-${createHash('sha256').update(identity.toLowerCase()).digest('hex').slice(0, 16)}-${purpose}`;
 }
 
 // sun_path is 104 bytes on macOS and 108 elsewhere, both including the NUL; a Windows named pipe path is capped at 259 characters, which for the ASCII names OptChat generates is also its byte length. Node 22 binds a truncated socket instead of failing, so the length is checked before listen.

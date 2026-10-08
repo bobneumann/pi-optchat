@@ -521,7 +521,8 @@ export default function optchat(pi: ExtensionAPI) {
     }
     if (action === 'browse') {
       const a = required(), file = exportBrowser(a.memory, a.name, a.dir);
-      if (ctx.hasUI) execFile(isWindows ? 'explorer.exe' : process.platform === 'darwin' ? 'open' : 'xdg-open', [file], error => { if (error) ctx.ui.notify(`Open ${file}`, 'info'); });
+      // explorer.exe exits 1 even when it opened the file, so only its launch failing counts there.
+      if (ctx.hasUI) execFile(isWindows ? 'explorer.exe' : process.platform === 'darwin' ? 'open' : 'xdg-open', [file], error => { if (error && (!isWindows || error.code === 'ENOENT')) ctx.ui.notify(`Open ${file}`, 'info'); });
       ctx.ui.notify(file, 'info'); return;
     }
     if (action) throw new Error('Use /optchat [profile|settings|model|agents|usage|activity|instructions|browse|import].');
