@@ -219,8 +219,10 @@ async function unzip(zip: string, member?: string, signal?: AbortSignal) {
   try { return (await exec(tool, args, { signal, maxBuffer: member === undefined ? 10_000_000 : 1_000_000_000, windowsHide: true })).stdout; }
   catch (error) {
     if (signal?.aborted || !record(error)) throw error;
-    const reason = error.code === 'ENOENT' ? `${tool} was not found` : string(error.stderr)?.trim().split(/\r?\n/)[0] || String(error.message);
-    throw new Error(`Could not read ${member === undefined ? zip : `${member} in ${zip}`}: ${reason}. Extract the ZIP and select the folder instead.`);
+    // unzip opens with a `[file]` line and wraps its message, so keep the first sentence after it.
+    const said = string(error.stderr)?.split(/\r?\n/).filter(line => !line.trim().startsWith('[')).join(' ').replace(/\s+/g, ' ').trim();
+    const reason = error.code === 'ENOENT' ? `${tool} was not found` : said?.match(/^.*?[.!](?=\s|$)/)?.[0] ?? (said?.slice(0, 200) || String(error.message));
+    throw new Error(`Could not read ${member === undefined ? zip : `${member} in ${zip}`}: ${reason.replace(/[.!]$/, '')}. Extract the ZIP and select the folder instead.`);
   }
 }
 export async function scanChatGPT(input: string, signal?: AbortSignal): Promise<Scan> {

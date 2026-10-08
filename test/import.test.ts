@@ -479,7 +479,8 @@ test('a ChatGPT ZIP reads stored and deflated members, and refuses a corrupt mem
     assert.deepEqual(scan.conversations.map(c => [c.id, c.file]).sort(), [[`deflated-chat`, `${zip}:export/conversations_2.json`], ['stored-chat', `${zip}:conversations_1.json`]]);
     for (const c of scan.conversations) assert.deepEqual(c.exported, JSON.parse(String(c.id === 'stored-chat' ? stored : deflated))[0]);
     await assert.rejects(scanChatGPT(corrupt), /Could not read conversations\.json in .*Extract the ZIP and select the folder instead\./);
-    await assert.rejects(scanChatGPT(fake), /Could not read .*fake\.zip: .*Extract the ZIP and select the folder instead\./);
+    // The tool's own reason, not just the file name unzip prints first.
+    await assert.rejects(scanChatGPT(fake), /Could not read .*fake\.zip: (?!\[)\S.*\. Extract the ZIP and select the folder instead\./);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

@@ -87,7 +87,7 @@ function readOwner(path: string) {
     socket.setTimeout(1500, () => { socket.destroy(); reject(new Error('Profile lock did not respond; refusing to steal it.')); });
     socket.on('data', data => { message += data.toString(); });
     socket.on('end', () => resolve(message || 'another Pi instance'));
-    socket.on('error', e => { if ('code' in e && (e.code === 'ECONNREFUSED' || e.code === 'ENOENT')) resolve(undefined); else reject(e); });
+    socket.on('error', e => { if ('code' in e && (e.code === 'ECONNREFUSED' || isWindows && e.code === 'ENOENT')) resolve(undefined); else reject(e); });
   });
 }
 
